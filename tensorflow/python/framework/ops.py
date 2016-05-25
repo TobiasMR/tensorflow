@@ -42,6 +42,30 @@ from tensorflow.python.platform import tf_logging as logging
 from tensorflow.python.util import compat
 
 
+def _override_helper(clazz_object, operator, func):
+  """Overrides (string) operator on Tensors to call func.
+
+  Args:
+    clazz_object: the class to override for; either Tensor or SparseTensor.
+    operator: the string name of the operator to override.
+    func: the function that replaces the overriden operator.
+
+  Raises:
+    ValueError: If operator has already been overwritten,
+      or if operator is not allowed to be overwritten.
+  """
+  existing = getattr(clazz_object, operator, None)
+  if existing is not None:
+    # Check to see if this is a default method-wrapper or slot wrapper which
+    # will be true for the comparison operators.
+    if not isinstance(existing, type(object.__lt__)):
+      raise ValueError("operator %s cannot be overwritten again on class %s." %
+                       (operator, clazz_object))
+  if operator not in Tensor.OVERLOADABLE_OPERATORS:
+    raise ValueError("Overriding %s is disallowed" % operator)
+  setattr(clazz_object, operator, func)
+
+
 def _convert_stack(stack):
   """Converts a stack extracted using _extract_stack() to a traceback stack.
 
@@ -110,6 +134,53 @@ def _as_graph_element(obj):
   if conv_fn and callable(conv_fn):
     return conv_fn()
   return None
+
+
+_TENSOR_LIKE_TYPES = tuple()
+
+
+def is_dense_tensor_like(t):
+  """EXPERIMENTAL: Returns true if `t` implements the tensor interface.
+
+  See `register_dense_tensor_like_type()` for the current definition of a
+  "tensor-like type".
+
+  Args:
+    t: An object.
+
+  Returns:
+    True iff `t` is an instance of one of the registered "tensor-like" types.
+  """
+  return isinstance(t, _TENSOR_LIKE_TYPES)
+
+
+def register_dense_tensor_like_type(tensor_type):
+  """EXPERIMENTAL: Registers `tensor_type` as implementing the tensor interface.
+
+  A "tensor-like type" can represent a single dense tensor, and implements
+  the `name` and `dtype` properties.
+
+  Args:
+    tensor_type: A type implementing the tensor interface.
+
+  Raises:
+    TypeError: If `tensor_type` does not implement the tensor interface.
+  """
+  try:
+    if not isinstance(tensor_type.name, property):
+      raise TypeError("Type %s does not define a `name` property")
+  except AttributeError:
+    raise TypeError("Type %s does not define a `name` property")
+  try:
+    if not isinstance(tensor_type.dtype, property):
+      raise TypeError("Type %s does not define a `dtype` property")
+  except AttributeError:
+    raise TypeError("Type %s does not define a `dtype` property")
+  # We expect this list to be small, so choose quadratic complexity
+  # for registration, so that we have a tuple that can be used for
+  # more efficient `isinstance` checks later.
+  global _TENSOR_LIKE_TYPES
+  _TENSOR_LIKE_TYPES = tuple(list(_TENSOR_LIKE_TYPES) + [tensor_type])
 
 
 class Tensor(object):
@@ -408,25 +479,7 @@ class Tensor(object):
 
   @staticmethod
   def _override_operator(operator, func):
-    """Overrides (string) operator on Tensors to call func.
-
-    Args:
-      operator: the string name of the operator to override.
-      func: the function that replaces the overriden operator.
-
-    Raises:
-      ValueError: If operator has already been overwritten,
-        or if operator is not allowed to be overwritten.
-    """
-    existing = getattr(Tensor, operator, None)
-    if existing is not None:
-      # Check to see if this is a default method-wrapper or slot wrapper which
-      # will be true for the comparison operators.
-      if not isinstance(existing, type(object.__lt__)):
-        raise ValueError("operator %s cannot be overwritten again." % operator)
-    if operator not in Tensor.OVERLOADABLE_OPERATORS:
-      raise ValueError("Overriding %s is disallowed" % operator)
-    setattr(Tensor, operator, func)
+    _override_helper(Tensor, operator, func)
 
   def __iter__(self):
     """Dummy method to prevent iteration. Do not call.
@@ -513,6 +566,7 @@ def _TensorTensorConversionFunction(t, dtype=None, name=None, as_ref=False):
 
 _tensor_conversion_func_registry = {
     0: [(Tensor, _TensorTensorConversionFunction)]}
+register_dense_tensor_like_type(Tensor)
 
 
 def convert_to_tensor(value, dtype=None, name=None, as_ref=False):
@@ -546,7 +600,8 @@ def convert_to_tensor(value, dtype=None, name=None, as_ref=False):
     dtype: Optional element type for the returned tensor. If missing, the
       type is inferred from the type of `value`.
     name: Optional name to use if a new `Tensor` is created.
-    as_ref: True if we want the result as a ref tensor.
+    as_ref: True if we want the result as a ref tensor. Only used if a new
+      `Tensor` is created.
 
   Returns:
     A `Tensor` based on `value`.
@@ -563,6 +618,8 @@ def convert_to_tensor(value, dtype=None, name=None, as_ref=False):
     for base_type, conversion_func in funcs_at_priority:
       if isinstance(value, base_type):
         ret = conversion_func(value, dtype=dtype, name=name, as_ref=as_ref)
+        if ret is NotImplemented:
+          continue
         if not isinstance(ret, Tensor):
           raise RuntimeError(
               "%sConversion function %r for type %s returned non-Tensor: %r"
@@ -692,6 +749,10 @@ def register_tensor_conversion_function(base_type, conversion_func,
   It must return a `Tensor` with the given `dtype` if specified. If the
   conversion function creates a new `Tensor`, it should use the given
   `name` if specified. All exceptions will be propagated to the caller.
+
+  The conversion function may return `NotImplemented` for some
+  inputs. In this case, the conversion process will continue to try
+  subsequent conversion functions.
 
   If `as_ref` is true, the function must return a `Tensor` reference,
   such as a `Variable`.
@@ -883,6 +944,13 @@ class SparseTensor(object):
   @@graph
   """
 
+  @classmethod
+  def from_value(cls, sparse_tensor_value):
+    return SparseTensor(
+        indices=sparse_tensor_value.indices,
+        values=sparse_tensor_value.values,
+        shape=sparse_tensor_value.shape)
+
   def __init__(self, indices, values, shape):
     """Creates a `SparseTensor`.
 
@@ -974,11 +1042,14 @@ class SparseTensor(object):
 
     Returns:
       A `SparseTensorValue` object.
-
     """
     indices, values, shape = _eval_using_default_session(
         [self.indices, self.values, self.shape], feed_dict, self.graph, session)
     return SparseTensorValue(indices, values, shape)
+
+  @staticmethod
+  def _override_operator(operator, func):
+    _override_helper(SparseTensor, operator, func)
 
 
 SparseTensorValue = collections.namedtuple("SparseTensorValue",
@@ -1292,6 +1363,24 @@ class Operation(object):
     tensor._add_consumer(self)  # pylint: disable=protected-access
     self._recompute_node_def()
 
+  def _add_control_inputs(self, ops):
+    """Add a list of new control inputs to this operation.
+
+    Args:
+      ops: the list of Operations to add as control input.
+
+    Raises:
+      TypeError: if ops is not a list of Operations.
+      ValueError: if any op in ops is from a different graph.
+    """
+    if ops:
+      for op in ops:
+        if not isinstance(op, Operation):
+          raise TypeError("op must be an Operation: %s" % op)
+        _assert_same_graph(self, op)
+        self._control_inputs.append(op)
+      self._recompute_node_def()
+
   def _add_control_input(self, op):
     """Add a new control input to this operation.
 
@@ -1302,11 +1391,7 @@ class Operation(object):
       TypeError: if op is not an Operation.
       ValueError: if op is from a different graph.
     """
-    if not isinstance(op, Operation):
-      raise TypeError("op must be an Operation: %s" % op)
-    _assert_same_graph(self, op)
-    self._control_inputs.append(op)
-    self._recompute_node_def()
+    self._add_control_inputs([op])
 
   # Methods below are used when building the NodeDef and Graph proto.
   def _recompute_node_def(self):
@@ -1811,6 +1896,7 @@ class Graph(object):
   may define additional collections by specifying a new name.
 
   @@add_to_collection
+  @@add_to_collections
   @@get_collection
   @@get_collection_ref
 
@@ -2003,6 +2089,7 @@ class Graph(object):
       if from_version is None or op_id > from_version:
         graph.node.extend([op.node_def])
         if op.outputs and add_shapes:
+          assert "_output_shapes" not in graph.node[-1].attr
           graph.node[-1].attr["_output_shapes"].list.shape.extend([
               output.get_shape().as_proto() for output in op.outputs])
         bytesize += op.node_def.ByteSize()
@@ -2744,6 +2831,10 @@ class Graph(object):
     * If it is None, all `device()` invocations from the enclosing context
       will be ignored.
 
+    For information about the valid syntax of device name strings, see
+    the documentation in
+    [`DeviceNameUtils`](https://www.tensorflow.org/code/tensorflow/core/util/device_name_utils.h).
+
     For example:
 
     ```python
@@ -3215,6 +3306,7 @@ class _DefaultStack(threading.local):
 
   def __init__(self):
     super(_DefaultStack, self).__init__()
+    self._enforce_nesting = True
     self.stack = []
 
   def get_default(self):
@@ -3223,6 +3315,14 @@ class _DefaultStack(threading.local):
   def reset(self):
     self.stack = []
 
+  @property
+  def enforce_nesting(self):
+    return self._enforce_nesting
+
+  @enforce_nesting.setter
+  def enforce_nesting(self, value):
+    self._enforce_nesting = value
+
   @contextlib.contextmanager
   def get_controller(self, default):
     """A context manager for manipulating a default stack."""
@@ -3230,9 +3330,14 @@ class _DefaultStack(threading.local):
       self.stack.append(default)
       yield default
     finally:
-      assert self.stack[-1] is default
-      self.stack.pop()
-
+      if self._enforce_nesting:
+        if self.stack[-1] is not default:
+          raise AssertionError(
+              "Nesting violated for default stack of %s objects"
+              % type(default))
+        self.stack.pop()
+      else:
+        self.stack.remove(default)
 
 _default_session_stack = _DefaultStack()
 
@@ -3593,6 +3698,10 @@ class GraphKeys(object):
   BIASES = "biases"
   # Key to collect activations
   ACTIVATIONS = "activations"
+  # Key to collect update_ops
+  UPDATE_OPS = "update_ops"
+  # Key to collect losses
+  LOSSES = "losses"
 
   # Key to indicate various ops.
   INIT_OP = "init_op"
